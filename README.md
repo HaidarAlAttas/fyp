@@ -36,7 +36,7 @@ MoveKL links three things together:
 - Raw data kept unchanged so everything downstream can be rebuilt
 
 **Optional: machine learning**
-- Predict journey delay / route reliability from weather and historical delays, evaluated against OpenTripPlanner's scheduled times
+- Predict bus delay and route reliability from weather and historical delays, trained on the LinuxONE server and compared against OpenTripPlanner's scheduled times — see [Optional: machine learning](#optional-machine-learning)
 
 ## Architecture
 
@@ -56,6 +56,7 @@ flowchart LR
         PG[(PostgreSQL<br/>+ PostGIS)]
         OTP[OpenTripPlanner]
         API[FastAPI backend]
+        ML["ML training (optional)<br/>XGBoost / LightGBM<br/>weekly"]
     end
 
     subgraph Client
@@ -73,10 +74,17 @@ flowchart LR
     GTFS -->|daily check,<br/>rebuild if changed| OTP
     PG --> API
     OTP --> API
+    PG -.->|delay + weather<br/>history| ML
+    ML -.->|trained model| API
     API --> APP
     APP <--> FB
     APP --> OSM
+
+    classDef optional stroke-dasharray: 5 5
+    class ML optional
 ```
+
+*Dashed box and arrows = optional machine learning component.*
 
 | Job | Frequency |
 |---|---|
@@ -88,6 +96,7 @@ flowchart LR
 | GTFS static: check for a new feed version; validate and load only if changed | daily |
 | Data quality report | daily |
 | Rebuild OpenTripPlanner graph | whenever a new GTFS version is loaded |
+| *(Optional)* Retrain and evaluate ML model | weekly |
 
 The mobile app never calls data.gov.my directly — everything goes through the backend, which keeps within the data.gov.my rate limit (4 requests/minute per API).
 
@@ -113,6 +122,77 @@ All GTFS static data (stops, routes, trips, stop times, calendars, shapes) is st
 | `gtfs_change_log` | Differences between consecutive versions (added / removed / moved stops, added / removed routes and trips) |
 
 Old versions are kept because historical bus delays were calculated against the timetable that was active at the time, which matters for reprocessing data and for training delay models. The original zip files are also kept unchanged in raw storage, so any version can be reloaded.
+
+## Optional: machine learning
+
+If time allows in FYP2, MoveKL adds a model that predicts how late a bus journey is likely to be, given the weather. It is trained on the same IBM LinuxONE server, using the history the pipeline has collected. The rest of the system does not depend on it: OpenTripPlanner stays the routing engine and the fallback.
+
+```mermaid
+flowchart LR
+    subgraph PG["PostgreSQL"]
+        D[(Bus delay history)]
+        W[(Stored hourly forecasts<br/>+ MET warnings)]
+        G[(GTFS versions<br/>routes, stops, timetable)]
+    end
+
+    subgraph Train["Weekly training job (Airflow, LinuxONE CPU)"]
+        F[Build features]
+        S[Time-based split<br/>train older weeks · test latest week]
+        M[Train XGBoost / LightGBM<br/>+ baseline]
+        E{Better than baseline<br/>and current model?}
+    end
+
+    REG[(Model registry<br/>model file + metrics)]
+    API[FastAPI]
+    OTP[OpenTripPlanner<br/>scheduled itineraries]
+    APP[Flutter app]
+
+    D --> F
+    W --> F
+    G --> F
+    F --> S --> M --> E
+    E -->|yes: promote| REG
+    E -->|no: keep current| REG
+    REG --> API
+    OTP --> API
+    API -->|predicted duration<br/>+ reliability| APP
+
+    classDef optional stroke-dasharray: 5 5
+    class F,S,M,E,REG optional
+```
+
+**What it predicts**
+
+| Output | Type | Shown in the app as |
+|---|---|---|
+| Expected delay (minutes) for each bus leg | Regression | Predicted journey time next to the scheduled time |
+| Probability the leg is more than 5 minutes late | Classification | Reliability: high / medium / low |
+
+**Features**
+
+- **Route and stop:** route, direction, stop, position along the route, scheduled headway
+- **Time:** hour of day, day of week, public or school holiday
+- **Weather:** forecast rainfall and rain probability for the hour of travel, active MET warning
+- **Recent conditions:** average delay on the same route in the last hour
+
+The model is trained on the *forecasts* that were stored at the time, not on actual weather, because the app only has forecasts when a user plans a trip. This keeps training and prediction consistent.
+
+**Models and evaluation**
+
+- **Baseline:** historical average delay for the same route, hour and day type.
+- **Models:** XGBoost or LightGBM gradient-boosted trees, chosen because the data is tabular and they train quickly on CPU.
+- **Evaluation:** MAE and RMSE for delay minutes, F1 and ROC-AUC for the late / not-late class, compared against the baseline and against OpenTripPlanner's scheduled times. The split is by time, never random, so the model is always tested on weeks it has not seen.
+- **Promotion:** a new model replaces the current one only if it scores better on the latest test week.
+
+**Training on LinuxONE**
+
+- Runs weekly as an Airflow DAG on the server's CPUs; no GPU is needed for this data size.
+- Each trained model is saved with its metrics, training date range, feature list and the GTFS feed versions it was trained on, in a `ml_model_version` table, so any result can be traced and reproduced.
+- XGBoost and LightGBM may need to be built from source on s390x; IBM Snap ML is an s390x-native alternative. Results will be documented in `docs/s390x.md`.
+
+**Serving**
+
+FastAPI loads the active model at startup. For each bus leg in an OpenTripPlanner itinerary it fills `predicted_duration_min` and `reliability` in the API response. These fields are nullable: with no model, the app simply shows the scheduled times.
 
 ## Tech stack
 
@@ -206,7 +286,7 @@ Notes will be published in [`docs/s390x.md`](docs/s390x.md).
 - [ ] FastAPI backend (journeys, weather, warnings, saved places)
 - [ ] Flutter app: map, journey search, route details, weather, accounts
 - [ ] s390x deployment notes
-- [ ] (Optional) ML delay / reliability prediction
+- [ ] (Optional) ML delay / reliability prediction, trained weekly on LinuxONE
 
 ## Out of scope
 
