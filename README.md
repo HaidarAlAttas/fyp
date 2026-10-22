@@ -20,7 +20,7 @@ MoveKL links three things together:
 
 ## Features
 
-**Mobile app (Android)**
+**Mobile app**
 - Map of your location, nearby stops and live bus positions (OpenStreetMap)
 - Journey search, e.g. *UNITEN → KLCC*, with route options drawn on the map
 - Travel time, live bus delay status, rain expected during the trip, active MET warnings
@@ -48,7 +48,7 @@ flowchart LR
         MET[MET Malaysia<br/>warnings]
     end
 
-    subgraph Server["Server (Docker)"]
+    subgraph Server["IBM LinuxONE VM (Ubuntu, s390x)"]
         COL[Collector<br/>every 60 s]
         RAW[(Raw files)]
         AF[Apache Airflow<br/>batch jobs]
@@ -101,7 +101,7 @@ The mobile app never calls data.gov.my directly — everything goes through the 
 | Auth | Firebase Authentication (email/password, Google) |
 | Maps & search | OpenStreetMap tiles, Photon, PostgreSQL `pg_trgm` for stop search |
 | Machine learning (optional) | scikit-learn, XGBoost / LightGBM |
-| Deployment | Docker, Docker Compose |
+| Deployment | IBM LinuxONE virtual server (Ubuntu 24.04 LTS, s390x), services managed by systemd |
 
 ## Data sources
 
@@ -125,8 +125,8 @@ movekl/
 ├── backend/        # FastAPI service
 ├── otp/            # OpenTripPlanner config and graph build scripts
 ├── ml/             # Optional delay / reliability models
-├── docs/           # Architecture, data dictionary, s390x notes
-└── docker-compose.yml
+├── deploy/         # LinuxONE setup scripts and systemd service files
+└── docs/           # Architecture, data dictionary, s390x notes
 ```
 
 *Folders are added as each component is built.*
@@ -146,22 +146,26 @@ flutter run
 
 ### Server stack
 
-*Coming soon* — the pipeline, backend and OpenTripPlanner will run with:
+*Coming soon* — the pipeline, backend and OpenTripPlanner run directly on an IBM LinuxONE virtual server (Ubuntu, s390x). Each component is installed natively and runs as a systemd service:
 
 ```bash
-cp .env.example .env      # add your API keys / Firebase credentials
-docker compose up -d
+cp .env.example .env              # add your API keys / Firebase credentials
+sudo ./deploy/setup.sh            # install PostgreSQL/PostGIS, Python, Java, Airflow, OTP
+sudo systemctl enable --now movekl-collector movekl-api otp airflow-scheduler airflow-webserver
 ```
 
 ## Running on IBM LinuxONE (s390x)
 
-MoveKL is being developed and tested on IBM LinuxONE (s390x architecture). Not every component ships s390x container images, so this project documents what works and how:
+The whole server side of MoveKL runs on a single IBM LinuxONE virtual server (s390x architecture). Every component is installed natively and kept running 24/7 by systemd, which restarts any service that stops:
 
-- Python, PostgreSQL and Java (Eclipse Temurin) — official s390x builds
-- Apache Airflow — installed with pip on an s390x Python base image
-- PostGIS — installed from distribution packages
-- OpenTripPlanner — shaded JAR on an s390x JDK
-- ML libraries — tested for s390x availability; built from source where needed
+| Component | How it runs on LinuxONE |
+|---|---|
+| PostgreSQL + PostGIS | Ubuntu packages |
+| Collector | Python service (`movekl-collector`) |
+| Apache Airflow | Installed with pip in a Python virtual environment; scheduler and web UI as services |
+| OpenTripPlanner | Shaded JAR on an s390x JDK (Eclipse Temurin) |
+| FastAPI backend | Uvicorn service (`movekl-api`) behind HTTPS |
+| ML libraries | Tested for s390x availability; built from source where needed |
 
 Notes will be published in [`docs/s390x.md`](docs/s390x.md).
 
@@ -170,7 +174,7 @@ Notes will be published in [`docs/s390x.md`](docs/s390x.md).
 - [x] Requirements, use cases and system architecture
 - [x] UI design (Figma)
 - [x] Flutter project set up
-- [ ] GTFS-Realtime collector running 24/7
+- [ ] GTFS-Realtime collector running 24/7 on LinuxONE
 - [ ] PostgreSQL schema and GTFS static ingestion
 - [ ] Airflow DAGs: weather, warnings, cleaning, validation, data quality report
 - [ ] Bus delay calculation
