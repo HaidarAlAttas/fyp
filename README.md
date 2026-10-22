@@ -70,7 +70,7 @@ flowchart LR
     OM --> AF
     MET --> AF
     AF --> PG
-    GTFS --> OTP
+    GTFS -->|daily check,<br/>rebuild if changed| OTP
     PG --> API
     OTP --> API
     API --> APP
