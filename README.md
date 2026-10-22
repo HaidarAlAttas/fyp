@@ -29,7 +29,8 @@ MoveKL links three things together:
 
 **Data pipeline (the core of the project)**
 - Continuous collector for GTFS-Realtime bus positions (every 60 s)
-- Scheduled ingestion of GTFS static timetables, hourly weather forecasts and MET warnings
+- GTFS static timetables, stops and route shapes stored in PostgreSQL, checked daily and reloaded only when the feed changes, with every version kept
+- Scheduled ingestion of hourly weather forecasts and MET warnings
 - Cleaning, validation and data quality reporting
 - Bus delay calculation by projecting live positions onto GTFS route shapes
 - Raw data kept unchanged so everything downstream can be rebuilt
@@ -84,11 +85,34 @@ flowchart LR
 | MET Malaysia warnings (deduplicated) | every 15 min |
 | Open-Meteo hourly forecast | hourly |
 | Bus delay calculation (positions vs timetable) | hourly |
-| GTFS static timetables → PostgreSQL | daily |
+| GTFS static: check for a new feed version; validate and load only if changed | daily |
 | Data quality report | daily |
-| Rebuild OpenTripPlanner graph | weekly / when GTFS changes |
+| Rebuild OpenTripPlanner graph | whenever a new GTFS version is loaded |
 
 The mobile app never calls data.gov.my directly — everything goes through the backend, which keeps within the data.gov.my rate limit (4 requests/minute per API).
+
+## GTFS static data and versioning
+
+All GTFS static data (stops, routes, trips, stop times, calendars, shapes) is stored in PostgreSQL. The app gets station locations, stop search results and route details from the MoveKL backend, which reads PostgreSQL, so user activity never adds requests to data.gov.my. The pipeline downloads each GTFS feed once a day, no matter how many people use the app.
+
+**Daily update check (Airflow)**
+
+1. Download each operator's GTFS zip and compute its SHA-256 hash.
+2. If the hash matches the current version, stop — nothing changed.
+3. If it is different, register a new **feed version** and load the files into **staging tables**.
+4. Run validation checks on staging: required files and columns present, stops inside the Klang Valley bounding box, no duplicate stop coordinates, contiguous `shape_pt_sequence`, every trip's `shape_id` and `service_id` exists.
+5. If validation passes, mark the new version as **active** (the previous version stays in the database) and rebuild the OpenTripPlanner graph. If it fails, keep the current version and flag the failure in the data quality report.
+6. Record what changed between versions: stops added, removed or moved; routes and trips added or removed.
+
+**Version tables**
+
+| Table | Purpose |
+|---|---|
+| `gtfs_feed_version` | One row per downloaded feed version: operator, hash, downloaded at, validated, active from / to |
+| `gtfs_*` (stops, routes, trips, stop_times, calendar, calendar_dates, shapes) | GTFS data, each row tagged with its `feed_version_id` |
+| `gtfs_change_log` | Differences between consecutive versions (added / removed / moved stops, added / removed routes and trips) |
+
+Old versions are kept because historical bus delays were calculated against the timetable that was active at the time, which matters for reprocessing data and for training delay models. The original zip files are also kept unchanged in raw storage, so any version can be reloaded.
 
 ## Tech stack
 
@@ -116,8 +140,8 @@ The mobile app never calls data.gov.my directly — everything goes through the 
 ## Repository structure
 
 ```
-movekl/
-├── app/            # Flutter mobile app (Android)
+fyp/
+├── fyproject_app/  # Flutter mobile app (Android)
 ├── pipeline/
 │   ├── collector/  # Continuous GTFS-Realtime collector
 │   ├── dags/       # Airflow DAGs
@@ -138,8 +162,8 @@ movekl/
 Requirements: Flutter SDK, Android Studio or an Android device.
 
 ```bash
-git clone https://github.com/<your-username>/movekl.git
-cd movekl/app
+git clone https://github.com/HaidarAlAttas/fyp.git
+cd fyp/fyproject_app
 flutter pub get
 flutter run
 ```
@@ -175,7 +199,7 @@ Notes will be published in [`docs/s390x.md`](docs/s390x.md).
 - [x] UI design (Figma)
 - [x] Flutter project set up
 - [ ] GTFS-Realtime collector running 24/7 on LinuxONE
-- [ ] PostgreSQL schema and GTFS static ingestion
+- [ ] PostgreSQL schema and versioned GTFS static ingestion (daily change check)
 - [ ] Airflow DAGs: weather, warnings, cleaning, validation, data quality report
 - [ ] Bus delay calculation
 - [ ] OpenTripPlanner deployment for the Klang Valley
