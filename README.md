@@ -28,11 +28,11 @@ MoveKL links three things together:
 - Optional account (email or Google Sign-In) to save places (Home, Work, custom) and see trip history
 
 **Data pipeline (the core of the project)**
-- Continuous collector for GTFS-Realtime bus positions (every 60 s)
+- Continuous collector for GTFS-Realtime bus positions (every 30 s, matching the feed's update rate), with a live path for the app and a raw history path for the pipeline
 - GTFS static timetables, stops and route shapes stored in PostgreSQL, checked daily and reloaded only when the feed changes, with every version kept
 - Scheduled ingestion of hourly weather forecasts and MET warnings
 - Cleaning, validation and data quality reporting
-- Bus delay calculation by projecting live positions onto GTFS route shapes
+- Live delay for each bus, calculated as positions arrive by projecting them onto GTFS route shapes; hourly delay statistics for history
 - Raw data kept unchanged so everything downstream can be rebuilt
 
 **Optional: machine learning**
@@ -50,7 +50,7 @@ flowchart LR
     end
 
     subgraph Server["IBM LinuxONE VM (Ubuntu, s390x)"]
-        COL[Collector<br/>every 60 s]
+        COL[Collector<br/>every 30 s]
         RAW[(Raw files)]
         AF[Apache Airflow<br/>batch jobs]
         PG[(PostgreSQL<br/>+ PostGIS)]
@@ -65,7 +65,9 @@ flowchart LR
         OSM[OpenStreetMap<br/>tiles + Photon]
     end
 
-    RT --> COL --> RAW
+    RT --> COL
+    COL -->|history: raw feed| RAW
+    COL -->|live: latest positions<br/>+ current delay| PG
     RAW --> AF
     GTFS --> AF
     OM --> AF
@@ -88,17 +90,20 @@ flowchart LR
 
 | Job | Frequency |
 |---|---|
-| Collect GTFS-Realtime bus positions → raw files | every 60 s (continuous collector, not Airflow) |
-| Process raw positions: decode, clean, validate, load | every 15 min |
+| **Live path:** collect GTFS-Realtime bus positions, update latest positions and current delay per bus in PostgreSQL | every 30 s (continuous collector, not Airflow) |
+| **History path:** save each raw feed response unchanged as a file | every 30 s (same collector) |
+| Process raw files: decode, clean, validate, load into history tables | every 15 min |
 | MET Malaysia warnings (deduplicated) | every 15 min |
 | Open-Meteo hourly forecast | hourly |
-| Bus delay calculation (positions vs timetable) | hourly |
+| Historical delay statistics (positions vs timetable, per route / stop / hour) | hourly |
 | GTFS static: check for a new feed version; validate and load only if changed | daily |
 | Data quality report | daily |
 | Rebuild OpenTripPlanner graph | whenever a new GTFS version is loaded |
 | *(Optional)* Retrain and evaluate ML model | weekly |
 
-The mobile app never calls data.gov.my directly — everything goes through the backend, which keeps within the data.gov.my rate limit (4 requests/minute per API).
+**Two paths, one collector.** Airflow is a batch scheduler and is not used for anything that needs to be live. The collector runs on its own as a systemd service: every 30 seconds it updates a small `latest_vehicle_positions` table (each bus's newest position and current delay), so live buses in the app are at most about 30 seconds old. At the same time it saves the raw response unchanged; Airflow processes those files every 15 minutes into the history tables used for statistics, data quality reports and ML. Because the raw files are never modified, the history can always be rebuilt if a cleaning step changes.
+
+The mobile app never calls data.gov.my directly — everything goes through the backend. The collector stays within the data.gov.my rate limit (4 requests/minute per API) by staggering the feed requests across each 30-second cycle and backing off when it receives HTTP 429.
 
 ## GTFS static data and versioning
 
@@ -281,7 +286,7 @@ Notes will be published in [`docs/s390x.md`](docs/s390x.md).
 - [ ] GTFS-Realtime collector running 24/7 on LinuxONE
 - [ ] PostgreSQL schema and versioned GTFS static ingestion (daily change check)
 - [ ] Airflow DAGs: weather, warnings, cleaning, validation, data quality report
-- [ ] Bus delay calculation
+- [ ] Live delay per bus (collector) and hourly historical delay statistics (Airflow)
 - [ ] OpenTripPlanner deployment for the Klang Valley
 - [ ] FastAPI backend (journeys, weather, warnings, saved places)
 - [ ] Flutter app: map, journey search, route details, weather, accounts
